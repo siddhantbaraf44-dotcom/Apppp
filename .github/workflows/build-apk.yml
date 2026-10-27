@@ -1,0 +1,103 @@
+name: Build Android APK
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      create_release:
+        description: 'Also publish a GitHub Release with the APK attached'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: apk-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install SDK packages
+        run: |
+          yes | sdkmanager --licenses > /dev/null || true
+          sdkmanager --install "platforms;android-35" "build-tools;35.0.0" > /dev/null
+          echo "Installed platforms;android-35 and build-tools;35.0.0"
+
+      - name: Compute version
+        id: ver
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            echo "name=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
+            echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          else
+            echo "name=1.0.0" >> "$GITHUB_OUTPUT"
+            echo "tag=build-${GITHUB_RUN_NUMBER}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Restore persistent signing key
+        env:
+          KEY_B64: ${{ secrets.SHELF_SIGNING_KEY_B64 }}
+          CERT_B64: ${{ secrets.SHELF_SIGNING_CERT_B64 }}
+        run: |
+          mkdir -p signing
+          if [ -n "$KEY_B64" ] && [ -n "$CERT_B64" ]; then
+            printf '%s' "$KEY_B64" | base64 -d > signing/key.pk8
+            printf '%s' "$CERT_B64" | base64 -d > signing/cert.x509.pem
+            echo "Using persistent signing key from secrets."
+          else
+            echo "::warning title=Ephemeral signing key::Set SHELF_SIGNING_KEY_B64 and SHELF_SIGNING_CERT_B64 so users can update the app in place."
+          fi
+
+      - name: Build signed APK
+        env:
+          VERSION_CODE: ${{ github.run_number }}
+          VERSION_NAME: ${{ steps.ver.outputs.name }}
+          APK_BASENAME: Shelf-${{ steps.ver.outputs.name }}
+        run: bash scripts/build-apk.sh
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Shelf-APK-${{ steps.ver.outputs.name }}
+          path: dist/*.apk
+          if-no-files-found: error
+          retention-days: 90
+
+      # A manual release runs on a branch, so create the tag it needs first.
+      - name: Create tag for manual release
+        if: github.event_name == 'workflow_dispatch' && inputs.create_release
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag "${{ steps.ver.outputs.tag }}"
+          git push origin "${{ steps.ver.outputs.tag }}"
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.create_release)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.ver.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          name: Shelf ${{ steps.ver.outputs.name }}
+          files: dist/*.apk
+          generate_release_notes: true
